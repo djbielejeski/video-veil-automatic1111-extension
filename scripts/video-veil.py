@@ -107,7 +107,7 @@ class Script(scripts.Script):
             with gr.Row():
                 gr.HTML("<br /><h1 style='border-bottom: 1px solid #eee;'>Video Veil</h1>")
             with gr.Row():
-                gr.HTML("<div><a href='https://github.com/djbielejeski/video-veil-automatic1111-extension' target='_blank'>Video-Veil Github</a></div>")
+                gr.HTML("<div><a style='color: #0969da;' href='https://github.com/djbielejeski/video-veil-automatic1111-extension' target='_blank'>Video-Veil Github</a></div>")
 
             # Input type selection row, allow the user to choose their input type (*.MP4 file or Directory Path)
             with gr.Row():
@@ -253,4 +253,37 @@ class Script(scripts.Script):
         print(f"# of frames: {len(frames)}")
 
 
-        return
+        if len(frames) > 0:
+            output_image_list = []
+
+            # Loop over all the frames and process them
+            for i, frame in enumerate(frames):
+                # TODO: Plumb into Auto1111 progress indicators
+                cp = copy.copy(p)
+
+                # Set the ControlNet reference image
+                cp.control_net_input_image = [frame]
+
+
+                # Set the Img2Img reference image to the frame of the video
+                converted_frame_array = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                converted_frame = Image.fromarray(converted_frame_array)
+                cp.init_images = [converted_frame]
+
+                # Process the image via the normal Img2Img pipeline
+                print(f"-----------------PROCESSING THE IMAGE-----------------")
+                proc = process_images(cp)
+
+                # Capture the output, we will use this to re-create our video
+                img = proc.images[0]
+                output_image_list.append(img)
+
+                cp.close()
+
+            # Show the user what we generated
+            proc.images = output_image_list
+
+        else:
+            proc = process_images(p)
+
+        return proc
