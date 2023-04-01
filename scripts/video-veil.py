@@ -9,7 +9,7 @@ from PIL import Image
 import modules.scripts as scripts
 
 from modules import images
-from modules.processing import process_images
+from modules.processing import process_images, setup_color_correction
 from modules.shared import opts
 
 
@@ -270,8 +270,19 @@ class Script(scripts.Script):
                 converted_frame = Image.fromarray(converted_frame_array)
                 cp.init_images = [converted_frame]
 
+                # Color Correction
+                if color_correction == color_correction_option_none:
+                    pass
+                elif color_correction == color_correction_option_video:
+                    # Use the source video to apply color correction
+                    cp.color_corrections = [setup_color_correction(converted_frame)]
+                elif color_correction == color_correction_option_generated_image:
+                    if len(output_image_list) > 0:
+                        # use the previous frame for color correction
+                        cp.color_corrections = [setup_color_correction(output_image_list[-1])]
+
+
                 # Process the image via the normal Img2Img pipeline
-                print(f"-----------------PROCESSING THE IMAGE-----------------")
                 proc = process_images(cp)
 
                 # Capture the output, we will use this to re-create our video
