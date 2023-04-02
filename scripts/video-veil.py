@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 import gradio as gr
 from PIL import Image
-from tqdm import trange
 from datetime import datetime, timezone
 
 import modules.scripts as scripts
@@ -14,8 +13,6 @@ from modules import processing, shared, script_callbacks, images, sd_samplers, s
 from modules.processing import process_images, setup_color_correction
 from modules.shared import opts, cmd_opts, state, sd_model
 
-import torch
-import k_diffusion as K
 
 color_correction_option_none = 'None'
 color_correction_option_video = 'From Source Video'
@@ -27,12 +24,161 @@ color_correction_options = [
     color_correction_option_generated_image,
 ]
 
+class VideoVeilImage:
+    def __init__(self, frame_array: np.ndarray = None, frame_image: Image = None):
+        self.frame_array = frame_array
+        self.frame_image = frame_image
+        self.transformed_image: Image = None
+
+        if frame_array is not None:
+            converted_frame_array = cv2.cvtColor(self.frame_array, cv2.COLOR_BGR2RGB)
+            self.frame_image = Image.fromarray(converted_frame_array)
+        elif frame_image is not None:
+            self.frame_array = np.array(self.frame_image)
+
+        # Capture the dimensions of our image
+        self.height, self.width, _ = self.frame_array.shape
+
+    def set_transformed_image(self, image: Image):
+        self.transformed_image = image
+
+class VideoVeilSourceVideo:
+    def __init__(
+            self,
+            use_images_directory: bool,
+            video_path: str,
+            directory_upload_path: str,
+            test_run: bool,
+            test_run_frames_count: int,
+            throw_errors_when_invalid: bool = True,
+    ):
+        self.frames: list[VideoVeilImage] = []
+
+        self.use_images_directory: bool = use_images_directory
+        self.video_path: str = video_path
+        self.directory_upload_path: str = directory_upload_path
+        self.test_run: bool = test_run
+        self.test_run_frames_count: int = None if not test_run else test_run_frames_count
+        self.output_video_path: str = None
+        self.video_width: int = 0
+        self.video_height: int = 0
+
+
+        if use_images_directory:
+            print(f"directory_upload_path: {directory_upload_path}")
+            if directory_upload_path is None or not os.path.exists(directory_upload_path):
+                if throw_errors_when_invalid:
+                    raise Exception(f"Directory not found: '{directory_upload_path}'.")
+            else:
+                self._load_frames_from_folder()
+                self._set_video_dimensions()
+        else:
+            print(f"video_path: {video_path}")
+            if video_path is None or not os.path.exists(video_path):
+                if throw_errors_when_invalid:
+                    raise Exception(f"Video not found: '{video_path}'.")
+            else:
+                self._load_frames_from_video()
+                self._set_video_dimensions()
+
+    def create_mp4(self, seed: int, output_directory: str, img2img_gallery=None):
+        if self.test_run:
+            return
+        else:
+            # get the original file name, and slap a timestamp on it
+            original_file_name: str = ""
+            fps = 30  # TODO: Add this as an option when they pick a folder
+            if not self.use_images_directory:
+                original_file_name = os.path.basename(self.video_path)
+                clip = cv2.VideoCapture(self.video_path)
+                if clip:
+                    fps = clip.get(cv2.CAP_PROP_FPS)
+                    clip.release()
+            else:
+                original_file_name = f"{os.path.basename(self.directory_upload_path)}.mp4"
+
+            date_string = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+            file_name = f"{date_string}-{seed}-{original_file_name}"
+
+            output_directory = os.path.join(output_directory, "video-veil-output")
+            os.makedirs(output_directory, exist_ok=True)
+            output_path = os.path.join(output_directory, file_name)
+
+            print(f"Saving *.mp4 to: {output_path}")
+
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (self.video_width, self.video_height))
+
+            # write the images to the video file
+            for frame in self.frames:
+                out.write(cv2.cvtColor(np.array(frame.transformed_image), cv2.COLOR_RGB2BGR))
+
+            out.release()
+
+            self.output_path = output_path
+            if img2img_gallery is not None:
+                img2img_gallery.update([output_path])
+
+        return
+
+    def _load_frames_from_folder(self):
+        image_extensions = ['.jpg', '.jpeg', '.png']
+        image_names = [
+            file_name for file_name in os.listdir(self.directory_upload_path)
+            if any(file_name.endswith(ext) for ext in image_extensions)
+        ]
+
+        if len(image_names) <= 0:
+            raise Exception(f"No images (*.png, *.jpg, *.jpeg) found in '{self.directory_upload_path}'.")
+
+        self.frames = []
+        # Open the images and convert them to np.ndarray
+        for i, image_name in enumerate(image_names):
+
+            if self.test_run_frames_count is not None and len(self.frames) >= self.test_run_frames_count:
+                return
+
+            image_path = os.path.join(self.directory_upload_path, image_name)
+
+            # Convert the image
+            image = Image.open(image_path)
+
+            if not image.mode == "RGB":
+                image = image.convert("RGB")
+
+            self.frames.append(VideoVeilImage(frame_image=image))
+
+        return
+
+    def _load_frames_from_video(self):
+        cap = cv2.VideoCapture(self.video_path)
+        self.frames = []
+        if not cap.isOpened():
+            return
+        while True:
+            if self.test_run_frames_count is not None and len(self.frames) >= self.test_run_frames_count:
+                cap.release()
+                return
+
+            ret, frame = cap.read()
+            if ret:
+                self.frames.append(VideoVeilImage(frame_array=frame))
+            else:
+                cap.release()
+                return
+
+        return
+
+    def _set_video_dimensions(self):
+        if len(self.frames):
+            first_frame = self.frames[0]
+            self.video_width, self.video_height = first_frame.width, first_frame.height
+
+
 class Script(scripts.Script):
 
     def __init__(self):
-        self.width: int = 0
-        self.height: int = 0
-
+        self.source_video: VideoVeilSourceVideo = None
         self.img2img_component = gr.Image()
         self.img2img_gallery = gr.Gallery()
         self.img2img_w_slider = gr.Slider()
@@ -42,7 +188,7 @@ class Script(scripts.Script):
         return "Video-Veil"
 
     def show(self, is_img2img):
-        return scripts.AlwaysVisible
+        return is_img2img
 
     # How the script's is displayed in the UI. See https://gradio.app/docs/#components
     # for the different UI components you can use and how to create them.
@@ -54,8 +200,7 @@ class Script(scripts.Script):
         # control_net_models_count = opts.data.get("control_net_max_models_num", 1)
         # control_net_allow_script_control = opts.data.get("control_net_allow_script_control", False)
 
-        with gr.Accordion("Video Veil", open=False, elem_id="vv_accordion", visible=is_img2img):
-
+        with gr.Group(elem_id="vv_accordion"):
             with gr.Row():
                 gr.HTML("<br /><h1 style='border-bottom: 1px solid #eee;'>Video Veil</h1>")
             with gr.Row():
@@ -103,51 +248,50 @@ class Script(scripts.Script):
                 gr.HTML("<br />")
 
             with gr.Row(visible=False) as test_run_parameters_row:
-                max_frames_to_test_gr = gr.Slider(
+                test_run_frames_count_gr = gr.Slider(
                                 label="# of frames to test",
                                 value=1,
                                 minimum=1,
                                 maximum=100,
                                 step=1,
-                                elem_id="vv_max_frames_to_test",
+                                elem_id="vv_test_run_frames_count",
                                 interactive=True,
                             )
 
             # Click handlers and UI Updaters
 
-            # If the user selects a video, update the img2img sections
+            # If the user selects a video or directory, update the img2img sections
             def video_src_change(
                     use_directory_for_video: bool,
                     video_path: str,
                     directory_upload_path: str,
             ):
-                CHECK IF WE HAVE VALID PATHS BEFORE DOING ANY UPDATES HERE WITH THE FRAME
-
-                frames: list[tuple[np.ndarray, Image]] = self.get_frames(
+                temp_video = VideoVeilSourceVideo(
                     use_images_directory=use_directory_for_video,
                     video_path=video_path,
                     directory_upload_path=directory_upload_path,
                     test_run=True,
-                    max_frames_to_test=1,
-                    throw_errors_when_invalid=False,
+                    test_run_frames_count=1,
+                    throw_errors_when_invalid=False
                 )
-                if len(frames) > 0:
-                    # Update the img2img settings via the existing Gradio controls
-                    frame_array, frame_image = frames[0]
 
-                    self.width, self.height, _ = frame_array.shape
+                if len(temp_video.frames) > 0:
+                    # Update the img2img settings via the existing Gradio controls
+                    first_frame = temp_video.frames[0]
+
                     return {
-                        self.img2img_component: gr.update(value=frame_image),
-                        self.img2img_w_slider: gr.update(value=self.width),
-                        self.img2img_h_slider: gr.update(value=self.height),
-                        video_source_info_gr: gr.update(value=f"<div style='color: #333'>Video Frames found: {self.width}x{self.height}px</div>")
+                        self.img2img_component: gr.update(value=first_frame.frame_image),
+                        self.img2img_w_slider: gr.update(value=first_frame.width),
+                        self.img2img_h_slider: gr.update(value=first_frame.height),
+                        video_source_info_gr: gr.update(value=f"<div style='color: #333'>Video Frames found: {first_frame.width}x{first_frame.height}px</div>")
                     }
                 else:
+                    error_message = "" if video_path is None or directory_upload_path is None or directory_upload_path == "" else "Invalid source, unable to parse video frames from input."
                     return {
                         self.img2img_component: gr.update(value=None),
                         self.img2img_w_slider: gr.update(value=512),
                         self.img2img_h_slider: gr.update(value=512),
-                        video_source_info_gr: gr.update(value=f"<div style='color: red'>Invalid source, unable to parse video frames from input.</div>")
+                        video_source_info_gr: gr.update(value=f"<div style='color: red'>{error_message}</div>")
                     }
 
             source_inputs = [
@@ -215,128 +359,9 @@ class Script(scripts.Script):
             directory_upload_path_gr,
             color_correction_gr,
             test_run_gr,
-            max_frames_to_test_gr,
+            test_run_frames_count_gr,
         )
 
-    # Helper function to get the frames from either the directory or from the uploaded *.mp4 file
-    def get_frames(
-            self,
-            use_images_directory: bool,
-            video_path: str,
-            directory_upload_path: str,
-            test_run: bool,
-            max_frames_to_test: int,
-            throw_errors_when_invalid: bool = True,
-    ) -> list[tuple[np.ndarray, Image]]:
-
-        def get_all_frames_from_video(video_path: str, count: int = None) -> list[tuple[np.ndarray, Image]]:
-            cap = cv2.VideoCapture(video_path)
-            frame_list: list[tuple[np.ndarray, Image]] = []
-            if not cap.isOpened():
-                return
-            while True:
-                if count is not None and len(frame_list) >= count:
-                    return frame_list
-
-                ret, frame = cap.read()
-                if ret:
-                    converted_frame_array = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    converted_frame = Image.fromarray(converted_frame_array)
-                    frame_list.append([frame, converted_frame])
-                else:
-                    return frame_list
-
-        def get_all_frames_from_folder(folder_path: str, count: int = None) -> list[tuple[np.ndarray, Image]]:
-            image_extensions = ['.jpg', '.jpeg', '.png']
-            image_names = [
-                file_name for file_name in os.listdir(folder_path)
-                if any(file_name.endswith(ext) for ext in image_extensions)
-            ]
-
-            if len(image_names) <= 0:
-                raise Exception(f"No images (*.png, *.jpg, *.jpeg) found in '{folder_path}'.")
-
-            frame_list: list[np.ndarray] = []
-            # Open the images and convert them to np.ndarray
-            for i, image_name in enumerate(image_names):
-
-                if count is not None and len(frame_list) >= count:
-                    return frame_list
-
-                image_path = os.path.join(folder_path, image_name)
-
-                # Convert the image
-                image = Image.open(image_path)
-
-                if not image.mode == "RGB":
-                    image = image.convert("RGB")
-
-                frame_list.append([np.array(image), image])
-
-            return frame_list
-
-        frames: list[tuple[np.ndarray, Image]] = []
-        frame_count: int = max_frames_to_test if test_run else None
-
-        if use_images_directory:
-            print(f"directory_upload_path: {directory_upload_path}")
-
-            if not os.path.exists(directory_upload_path):
-                if throw_errors_when_invalid:
-                    raise Exception(f"Directory not found: '{directory_upload_path}'.")
-            else:
-                frames = get_all_frames_from_folder(folder_path=directory_upload_path, count=frame_count)
-        else:
-            print(f"video_uploader: {video_path}")
-            if not os.path.exists(video_path):
-                if throw_errors_when_invalid:
-                    raise Exception(f"Video not found: '{video_path}'.")
-            else:
-                frames = get_all_frames_from_video(video_path=video_path, count=frame_count)
-
-        return frames
-
-
-    def create_mp4(self,
-                   use_images_directory: bool,
-                   video_path: str,
-                   directory_upload_path: str,
-                   seed: int,
-                   output_directory,
-                   output_image_list,
-    ) -> str:
-
-        # get the original file name, and slap a timestamp on it
-        original_file_name: str = ""
-        fps = 30  # TODO: Add this as an option when they pick a folder
-        if not use_images_directory:
-            original_file_name = os.path.basename(video_path)
-            clip = cv2.VideoCapture(video_path)
-            if clip:
-                fps = clip.get(cv2.CAP_PROP_FPS)
-                clip.release()
-        else:
-            original_file_name = f"{os.path.basename(directory_upload_path)}.mp4"
-
-        date_string = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-        file_name = f"{date_string}-{seed}-{original_file_name}"
-
-        output_directory = os.path.join(output_directory, "video-veil-output")
-        os.makedirs(output_directory, exist_ok=True)
-        output_path = os.path.join(output_directory, file_name)
-
-        print(f"Saving *.mp4 to: {output_path}")
-
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (self.width, self.height))
-
-        # write the images to the video file
-        for image in output_image_list:
-            out.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
-
-        out.release()
-
-        return output_path
 
     # From: https://github.com/LonicaMewinsky/gif2gif/blob/main/scripts/gif2gif.py
     # Grab the img2img image components for update later
@@ -355,7 +380,16 @@ class Script(scripts.Script):
             self.img2img_h_slider = component
             return self.img2img_h_slider
 
-    def process(
+    """
+    This function is called if the script has been selected in the script dropdown.
+    It must do all processing and return the Processed object with results, same as
+    one returned by processing.process_images.
+
+    Usually the processing is done by calling the processing.process_images function.
+
+    args contains all values returned by components from ui()
+    """
+    def run(
             self,
             p,
             use_images_directory: bool,
@@ -363,90 +397,74 @@ class Script(scripts.Script):
             directory_upload_path: str,
             color_correction: str,
             test_run: bool,
-            max_frames_to_test: int,
+            test_run_frames_count: int,
     ):
-        """
-        This function is called before processing begins for AlwaysVisible scripts.
-        You can modify the processing object (p) here, inject hooks, etc.
-        args contains all values returned by components from ui()
-        """
         no_video_path = video_path is None or video_path == ""
         no_directory_upload_path = directory_upload_path is None or directory_upload_path == ""
         enabled = not no_video_path or not no_directory_upload_path
         if enabled:
-            pass
-        else:
             print(f"use_images_directory: {use_images_directory}")
 
-            frames: list[tuple[np.ndarray, Image]] = self.get_frames(
+            source_video = VideoVeilSourceVideo(
                 use_images_directory=use_images_directory,
                 video_path=video_path,
                 directory_upload_path=directory_upload_path,
                 test_run=test_run,
-                max_frames_to_test=max_frames_to_test,
+                test_run_frames_count=test_run_frames_count,
             )
 
             print(f"color_correction: {color_correction}")
             print(f"test_run: {test_run}")
-            print(f"max_frames_to_test: {max_frames_to_test}")
-            print(f"# of frames: {len(frames)}")
+            print(f"test_run_frames_count: {test_run_frames_count}")
+            print(f"# of frames: {len(source_video.frames)}")
 
-            if len(frames) > 0:
-                state.job_count = len(frames) * p.n_iter
+            if len(source_video.frames) > 0:
+                state.job_count = len(source_video.frames) * p.n_iter
                 state.job_no = 0
 
-                output_image_list = []
-
                 # Loop over all the frames and process them
-                for i, frame in enumerate(frames):
+                for i, frame in enumerate(source_video.frames):
+                    if state.skipped: state.skipped = False
+                    if state.interrupted: break
+
                     # TODO: Plumb into Auto1111 progress indicators
                     state.job = f"{state.job_no + 1} out of {state.job_count}"
-
-                    frame_array, frame_image = frame
 
                     cp = copy.copy(p)
 
                     # Set the ControlNet reference image
-                    cp.control_net_input_image = [frame_array]
+                    cp.control_net_input_image = [frame.frame_array]
 
                     # Set the Img2Img reference image to the frame of the video
-                    cp.init_images = [frame_image]
+                    cp.init_images = [frame.frame_image]
 
                     # Color Correction
                     if color_correction == color_correction_option_none:
                         pass
                     elif color_correction == color_correction_option_video:
                         # Use the source video to apply color correction
-                        cp.color_corrections = [setup_color_correction(frame_image)]
+                        cp.color_corrections = [setup_color_correction(frame.frame_image)]
                     elif color_correction == color_correction_option_generated_image:
-                        if len(output_image_list) > 0:
+                        if len(source_video.frames) > 0 and source_video.frames[-1].transformed_image is not None:
                             # use the previous frame for color correction
-                            cp.color_corrections = [setup_color_correction(output_image_list[-1])]
+                            cp.color_corrections = [setup_color_correction(source_video.frames[-1].transformed_image)]
 
 
                     # Process the image via the normal Img2Img pipeline
                     proc = process_images(cp)
 
                     # Capture the output, we will use this to re-create our video
-                    img = proc.images[0]
-                    output_image_list.append(img)
+                    frame.set_transformed_image(proc.images[0])
 
                     cp.close()
 
                 # Show the user what we generated
-                proc.images = output_image_list
+                proc.images = [frame.transformed_image for frame in source_video.frames]
 
                 # now create a video
-                if not test_run:
-                    output_video_file_path = self.create_mp4(
-                        use_images_directory=use_images_directory,
-                        video_path=video_path,
-                        directory_upload_path=directory_upload_path,
-                        seed=proc.seed,
-                        output_directory=cp.outpath_samples,
-                        output_image_list=output_image_list,
-                    )
+                source_video.create_mp4(seed=proc.seed, output_directory=cp.outpath_samples, img2img_gallery=self.img2img_gallery)
 
-                    self.img2img_gallery.update([output_video_file_path])
+        else:
+            proc = process_images(p)
 
         return proc
