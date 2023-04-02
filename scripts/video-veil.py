@@ -39,8 +39,6 @@ class VideoVeilImage:
         # Capture the dimensions of our image
         self.height, self.width, _ = self.frame_array.shape
 
-    def set_transformed_image(self, image: Image):
-        self.transformed_image = image
 
 class VideoVeilSourceVideo:
     def __init__(
@@ -454,7 +452,7 @@ class Script(scripts.Script):
                     proc = process_images(cp)
 
                     # Capture the output, we will use this to re-create our video
-                    frame.set_transformed_image(proc.images[0])
+                    frame.transformed_image = proc.images[0]
 
                     cp.close()
 
