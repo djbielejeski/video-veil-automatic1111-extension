@@ -10,7 +10,7 @@ from tqdm import trange
 from datetime import datetime, timezone
 
 import modules.scripts as scripts
-from modules import processing, shared, images, sd_samplers, sd_samplers_common
+from modules import processing, shared, script_callbacks, images, sd_samplers, sd_samplers_common
 from modules.processing import process_images, setup_color_correction
 from modules.shared import opts, cmd_opts, state, sd_model
 
@@ -29,11 +29,20 @@ color_correction_options = [
 
 class Script(scripts.Script):
 
+    def __init__(self):
+        self.width: int = 0
+        self.height: int = 0
+
+        self.img2img_component = gr.Image()
+        self.img2img_gallery = gr.Gallery()
+        self.img2img_w_slider = gr.Slider()
+        self.img2img_h_slider = gr.Slider()
+
     def title(self):
         return "Video-Veil"
 
     def show(self, is_img2img):
-        return is_img2img
+        return scripts.AlwaysVisible
 
     # How the script's is displayed in the UI. See https://gradio.app/docs/#components
     # for the different UI components you can use and how to create them.
@@ -45,7 +54,7 @@ class Script(scripts.Script):
         # control_net_models_count = opts.data.get("control_net_max_models_num", 1)
         # control_net_allow_script_control = opts.data.get("control_net_allow_script_control", False)
 
-        with gr.Group() as video_veil_extension:
+        with gr.Accordion("Video Veil", open=False, elem_id="vv_accordion", visible=is_img2img):
 
             with gr.Row():
                 gr.HTML("<br /><h1 style='border-bottom: 1px solid #eee;'>Video Veil</h1>")
@@ -74,6 +83,10 @@ class Script(scripts.Script):
                 )
                 gr.HTML("<br />")
 
+            # Video Source Info Row
+            with gr.Row():
+                video_source_info_gr = gr.HTML("")
+
             # Color Correction
             with gr.Row():
                 color_correction_gr = gr.Dropdown(
@@ -101,6 +114,62 @@ class Script(scripts.Script):
                             )
 
             # Click handlers and UI Updaters
+
+            # If the user selects a video, update the img2img sections
+            def video_src_change(
+                    use_directory_for_video: bool,
+                    video_path: str,
+                    directory_upload_path: str,
+            ):
+                CHECK IF WE HAVE VALID PATHS BEFORE DOING ANY UPDATES HERE WITH THE FRAME
+
+                frames: list[tuple[np.ndarray, Image]] = self.get_frames(
+                    use_images_directory=use_directory_for_video,
+                    video_path=video_path,
+                    directory_upload_path=directory_upload_path,
+                    test_run=True,
+                    max_frames_to_test=1,
+                    throw_errors_when_invalid=False,
+                )
+                if len(frames) > 0:
+                    # Update the img2img settings via the existing Gradio controls
+                    frame_array, frame_image = frames[0]
+
+                    self.width, self.height, _ = frame_array.shape
+                    return {
+                        self.img2img_component: gr.update(value=frame_image),
+                        self.img2img_w_slider: gr.update(value=self.width),
+                        self.img2img_h_slider: gr.update(value=self.height),
+                        video_source_info_gr: gr.update(value=f"<div style='color: #333'>Video Frames found: {self.width}x{self.height}px</div>")
+                    }
+                else:
+                    return {
+                        self.img2img_component: gr.update(value=None),
+                        self.img2img_w_slider: gr.update(value=512),
+                        self.img2img_h_slider: gr.update(value=512),
+                        video_source_info_gr: gr.update(value=f"<div style='color: red'>Invalid source, unable to parse video frames from input.</div>")
+                    }
+
+            source_inputs = [
+                video_path_gr,
+                directory_upload_path_gr,
+            ]
+
+            for source_input in source_inputs:
+                source_input.change(
+                    fn=video_src_change,
+                    inputs=[
+                        use_images_directory_gr,
+                        video_path_gr,
+                        directory_upload_path_gr,
+                    ],
+                    outputs=[
+                        self.img2img_component,
+                        self.img2img_w_slider,
+                        self.img2img_h_slider,
+                        video_source_info_gr,
+                    ]
+                )
 
             # Upload type change
             def change_upload_type_click(
@@ -158,11 +227,11 @@ class Script(scripts.Script):
             test_run: bool,
             max_frames_to_test: int,
             throw_errors_when_invalid: bool = True,
-    ) -> list[np.ndarray]:
+    ) -> list[tuple[np.ndarray, Image]]:
 
-        def get_all_frames_from_video(video_path: str, count: int = None) -> list[np.ndarray]:
+        def get_all_frames_from_video(video_path: str, count: int = None) -> list[tuple[np.ndarray, Image]]:
             cap = cv2.VideoCapture(video_path)
-            frame_list: list[np.ndarray] = []
+            frame_list: list[tuple[np.ndarray, Image]] = []
             if not cap.isOpened():
                 return
             while True:
@@ -171,11 +240,13 @@ class Script(scripts.Script):
 
                 ret, frame = cap.read()
                 if ret:
-                    frame_list.append(frame)
+                    converted_frame_array = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    converted_frame = Image.fromarray(converted_frame_array)
+                    frame_list.append([frame, converted_frame])
                 else:
                     return frame_list
 
-        def get_all_frames_from_folder(folder_path: str, count: int = None) -> list[np.ndarray]:
+        def get_all_frames_from_folder(folder_path: str, count: int = None) -> list[tuple[np.ndarray, Image]]:
             image_extensions = ['.jpg', '.jpeg', '.png']
             image_names = [
                 file_name for file_name in os.listdir(folder_path)
@@ -200,11 +271,11 @@ class Script(scripts.Script):
                 if not image.mode == "RGB":
                     image = image.convert("RGB")
 
-                frame_list.append(np.array(image))
+                frame_list.append([np.array(image), image])
 
             return frame_list
 
-        frames: list[np.ndarray] = []
+        frames: list[tuple[np.ndarray, Image]] = []
         frame_count: int = max_frames_to_test if test_run else None
 
         if use_images_directory:
@@ -225,56 +296,66 @@ class Script(scripts.Script):
 
         return frames
 
-    def find_noise_for_image(self, p, cond, uncond, cfg_scale, steps):
-        x = p.init_latent
 
-        s_in = x.new_ones([x.shape[0]])
-        dnw = K.external.CompVisDenoiser(shared.sd_model)
-        sigmas = dnw.get_sigmas(steps).flip(0)
+    def create_mp4(self,
+                   use_images_directory: bool,
+                   video_path: str,
+                   directory_upload_path: str,
+                   seed: int,
+                   output_directory,
+                   output_image_list,
+    ) -> str:
 
-        state.sampling_steps = steps
+        # get the original file name, and slap a timestamp on it
+        original_file_name: str = ""
+        fps = 30  # TODO: Add this as an option when they pick a folder
+        if not use_images_directory:
+            original_file_name = os.path.basename(video_path)
+            clip = cv2.VideoCapture(video_path)
+            if clip:
+                fps = clip.get(cv2.CAP_PROP_FPS)
+                clip.release()
+        else:
+            original_file_name = f"{os.path.basename(directory_upload_path)}.mp4"
 
-        for i in trange(1, len(sigmas)):
-            state.sampling_step += 1
+        date_string = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+        file_name = f"{date_string}-{seed}-{original_file_name}"
 
-            x_in = torch.cat([x] * 2)
-            sigma_in = torch.cat([sigmas[i] * s_in] * 2)
-            cond_in = torch.cat([uncond, cond])
+        output_directory = os.path.join(output_directory, "video-veil-output")
+        os.makedirs(output_directory, exist_ok=True)
+        output_path = os.path.join(output_directory, file_name)
 
-            image_conditioning = torch.cat([p.image_conditioning] * 2)
-            cond_in = {"c_concat": [image_conditioning], "c_crossattn": [cond_in]}
+        print(f"Saving *.mp4 to: {output_path}")
 
-            c_out, c_in = [K.utils.append_dims(k, x_in.ndim) for k in dnw.get_scalings(sigma_in)]
-            t = dnw.sigma_to_t(sigma_in)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (self.width, self.height))
 
-            eps = shared.sd_model.apply_model(x_in * c_in, t, cond=cond_in)
-            denoised_uncond, denoised_cond = (x_in + eps * c_out).chunk(2)
+        # write the images to the video file
+        for image in output_image_list:
+            out.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
 
-            denoised = denoised_uncond + (denoised_cond - denoised_uncond) * cfg_scale
+        out.release()
 
-            d = (x - denoised) / sigmas[i]
-            dt = sigmas[i] - sigmas[i - 1]
+        return output_path
 
-            x = x + d * dt
+    # From: https://github.com/LonicaMewinsky/gif2gif/blob/main/scripts/gif2gif.py
+    # Grab the img2img image components for update later
+    # Maybe there's a better way to do this?
+    def after_component(self, component, **kwargs):
+        if component.elem_id == "img2img_image":
+            self.img2img_component = component
+            return self.img2img_component
+        if component.elem_id == "img2img_gallery":
+            self.img2img_gallery = component
+            return self.img2img_gallery
+        if component.elem_id == "img2img_width":
+            self.img2img_w_slider = component
+            return self.img2img_w_slider
+        if component.elem_id == "img2img_height":
+            self.img2img_h_slider = component
+            return self.img2img_h_slider
 
-            sd_samplers_common.store_latent(x)
-
-            # This shouldn't be necessary, but solved some VRAM issues
-            del x_in, sigma_in, cond_in, c_out, c_in, t,
-            del eps, denoised_uncond, denoised_cond, denoised, d, dt
-
-        state.nextjob()
-
-        return x / x.std()
-
-
-    # This is where the additional processing is implemented. The parameters include
-    # self, the model object "p" (a StableDiffusionProcessing class, see
-    # processing.py), and the parameters returned by the ui method.
-    # Custom functions can be defined here, and additional libraries can be imported
-    # to be used in processing. The return value should be a Processed object, which is
-    # what is returned by the process_images method.
-    def run(
+    def process(
             self,
             p,
             use_images_directory: bool,
@@ -284,142 +365,88 @@ class Script(scripts.Script):
             test_run: bool,
             max_frames_to_test: int,
     ):
-
-        print(f"use_images_directory: {use_images_directory}")
-
-
-        frames: list[np.ndarray] = self.get_frames(
-            use_images_directory=use_images_directory,
-            video_path=video_path,
-            directory_upload_path=directory_upload_path,
-            test_run=test_run,
-            max_frames_to_test=max_frames_to_test,
-        )
-
-
-        print(f"color_correction: {color_correction}")
-
-        print(f"test_run: {test_run}")
-        print(f"max_frames_to_test: {max_frames_to_test}")
-
-        print(f"# of frames: {len(frames)}")
-
-
-        if len(frames) > 0:
-            state.job_count = len(frames)
-            state.job_no = 0
-
-            output_image_list = []
-            height, width, _ = frames[0].shape
-
-            # Loop over all the frames and process them
-            for i, frame in enumerate(frames):
-                # TODO: Plumb into Auto1111 progress indicators
-                state.job_no = i
-
-                cp = copy.copy(p)
-
-                # probably should set batch size to 1 here manually
-                cp.batch_size = 1
-
-                # overrides for reverse sampling
-                cp.sampler_name = "Euler"
-                cp.denoising_strength = 1.0
-
-                custom_cfg_scale = 2.0
-                original_cfg_scale = cp.cfg_scale
-                cp.cfg_scale = custom_cfg_scale
-
-                # Modified from img2imgalt in Automatic1111
-                def sample_extra(conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
-                    shared.state.job_count += 1
-                    cond = cp.sd_model.get_learned_conditioning(cp.batch_size * [cp.prompt])
-                    uncond = cp.sd_model.get_learned_conditioning(cp.batch_size * [cp.negative_prompt])
-
-                    # this could potentially be
-                    # noise = cp.sample(cp, rand_noise, cond, uncond, image_conditioning=cp.image_conditioning)
-                    noise = self.find_noise_for_image(cp, cond, uncond, original_cfg_scale, cp.steps)
-                    sampler = sd_samplers.create_sampler(cp.sampler_name, cp.sd_model)
-                    sigmas = sampler.model_wrap.get_sigmas(cp.steps)
-                    noise_dt = noise - (cp.init_latent / sigmas[0])
-                    # cp.seed = cp.seed + 1
-
-                    return sampler.sample_img2img(cp, cp.init_latent, noise_dt, conditioning, unconditional_conditioning, image_conditioning=cp.image_conditioning)
-
-                # setup the sampler to use the input image as our noise
-                cp.sample = sample_extra
-
-                # set the dimensions on the image
-                cp.height = height
-                cp.width = width
-
-                # Set the ControlNet reference image
-                cp.control_net_input_image = [frame]
-
-
-                # Set the Img2Img reference image to the frame of the video
-                converted_frame_array = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                converted_frame = Image.fromarray(converted_frame_array)
-                cp.init_images = [converted_frame]
-
-                # Color Correction
-                if color_correction == color_correction_option_none:
-                    pass
-                elif color_correction == color_correction_option_video:
-                    # Use the source video to apply color correction
-                    cp.color_corrections = [setup_color_correction(converted_frame)]
-                elif color_correction == color_correction_option_generated_image:
-                    if len(output_image_list) > 0:
-                        # use the previous frame for color correction
-                        cp.color_corrections = [setup_color_correction(output_image_list[-1])]
-
-
-                # Process the image via the normal Img2Img pipeline
-                proc = process_images(cp)
-
-                # Capture the output, we will use this to re-create our video
-                img = proc.images[0]
-                output_image_list.append(img)
-
-                cp.close()
-
-            # Show the user what we generated
-            proc.images = output_image_list
-
-            # now create a video
-            if not test_run:
-
-                # get the original file name, and slap a timestamp on it
-                original_file_name: str = ""
-                fps = 30 # TODO: Add this as an option when they pick a folder
-                if not use_images_directory:
-                    original_file_name = os.path.basename(video_path)
-                    clip = cv2.VideoCapture(video_path)
-                    if clip:
-                        fps = clip.get(cv2.CAP_PROP_FPS)
-                        clip.release()
-                else:
-                    original_file_name = f"{os.path.basename(directory_upload_path)}.mp4"
-
-                date_string = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-                file_name = f"{date_string}-{proc.seed}-{original_file_name}"
-
-                output_directory = os.path.join(cp.outpath_samples, "video-veil-output")
-                os.makedirs(output_directory, exist_ok=True)
-                output_path = os.path.join(output_directory, file_name)
-
-                print(f"Saving *.mp4 to: {output_path}")
-
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-                # write the images to the video file
-                for image in output_image_list:
-                    out.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
-
-                out.release()
-
+        """
+        This function is called before processing begins for AlwaysVisible scripts.
+        You can modify the processing object (p) here, inject hooks, etc.
+        args contains all values returned by components from ui()
+        """
+        no_video_path = video_path is None or video_path == ""
+        no_directory_upload_path = directory_upload_path is None or directory_upload_path == ""
+        enabled = not no_video_path or not no_directory_upload_path
+        if enabled:
+            pass
         else:
-            proc = process_images(p)
+            print(f"use_images_directory: {use_images_directory}")
+
+            frames: list[tuple[np.ndarray, Image]] = self.get_frames(
+                use_images_directory=use_images_directory,
+                video_path=video_path,
+                directory_upload_path=directory_upload_path,
+                test_run=test_run,
+                max_frames_to_test=max_frames_to_test,
+            )
+
+            print(f"color_correction: {color_correction}")
+            print(f"test_run: {test_run}")
+            print(f"max_frames_to_test: {max_frames_to_test}")
+            print(f"# of frames: {len(frames)}")
+
+            if len(frames) > 0:
+                state.job_count = len(frames) * p.n_iter
+                state.job_no = 0
+
+                output_image_list = []
+
+                # Loop over all the frames and process them
+                for i, frame in enumerate(frames):
+                    # TODO: Plumb into Auto1111 progress indicators
+                    state.job = f"{state.job_no + 1} out of {state.job_count}"
+
+                    frame_array, frame_image = frame
+
+                    cp = copy.copy(p)
+
+                    # Set the ControlNet reference image
+                    cp.control_net_input_image = [frame_array]
+
+                    # Set the Img2Img reference image to the frame of the video
+                    cp.init_images = [frame_image]
+
+                    # Color Correction
+                    if color_correction == color_correction_option_none:
+                        pass
+                    elif color_correction == color_correction_option_video:
+                        # Use the source video to apply color correction
+                        cp.color_corrections = [setup_color_correction(frame_image)]
+                    elif color_correction == color_correction_option_generated_image:
+                        if len(output_image_list) > 0:
+                            # use the previous frame for color correction
+                            cp.color_corrections = [setup_color_correction(output_image_list[-1])]
+
+
+                    # Process the image via the normal Img2Img pipeline
+                    proc = process_images(cp)
+
+                    # Capture the output, we will use this to re-create our video
+                    img = proc.images[0]
+                    output_image_list.append(img)
+
+                    cp.close()
+
+                # Show the user what we generated
+                proc.images = output_image_list
+
+                # now create a video
+                if not test_run:
+                    output_video_file_path = self.create_mp4(
+                        use_images_directory=use_images_directory,
+                        video_path=video_path,
+                        directory_upload_path=directory_upload_path,
+                        seed=proc.seed,
+                        output_directory=cp.outpath_samples,
+                        output_image_list=output_image_list,
+                    )
+
+                    self.img2img_gallery.update([output_video_file_path])
 
         return proc
