@@ -1,6 +1,7 @@
 import copy
 import os
 import shutil
+from tqdm import trange
 
 import cv2
 import numpy as np
@@ -13,6 +14,8 @@ from modules import processing, shared, script_callbacks, images, sd_samplers, s
 from modules.processing import process_images, setup_color_correction
 from modules.shared import opts, cmd_opts, state, sd_model
 
+import torch
+import k_diffusion as K
 
 color_correction_option_none = 'None'
 color_correction_option_video = 'From Source Video'
@@ -41,6 +44,61 @@ class VideoVeilImage:
 
     def set_transformed_image(self, image: Image):
         self.transformed_image = image
+
+    # Based on changes suggested by briansemrau in https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/736
+    def find_noise_for_image_sigma_adjustment(self, p, cond, uncond, cfg_scale: float, steps: int):
+        x = p.init_latent
+
+        s_in = x.new_ones([x.shape[0]])
+        if shared.sd_model.parameterization == "v":
+            dnw = K.external.CompVisVDenoiser(shared.sd_model)
+            skip = 1
+        else:
+            dnw = K.external.CompVisDenoiser(shared.sd_model)
+            skip = 0
+        sigmas = dnw.get_sigmas(steps).flip(0)
+
+        shared.state.sampling_steps = steps
+
+        for i in trange(1, len(sigmas)):
+            # shared.state.sampling_step += 1
+
+            x_in = torch.cat([x] * 2)
+            sigma_in = torch.cat([sigmas[i - 1] * s_in] * 2)
+            cond_in = torch.cat([uncond, cond])
+
+            image_conditioning = torch.cat([p.image_conditioning] * 2)
+            cond_in = {"c_concat": [image_conditioning], "c_crossattn": [cond_in]}
+
+            c_out, c_in = [K.utils.append_dims(k, x_in.ndim) for k in dnw.get_scalings(sigma_in)[skip:]]
+
+            if i == 1:
+                t = dnw.sigma_to_t(torch.cat([sigmas[i] * s_in] * 2))
+            else:
+                t = dnw.sigma_to_t(sigma_in)
+
+            eps = shared.sd_model.apply_model(x_in * c_in, t, cond=cond_in)
+            denoised_uncond, denoised_cond = (x_in + eps * c_out).chunk(2)
+
+            denoised = denoised_uncond + (denoised_cond - denoised_uncond) * cfg_scale
+
+            if i == 1:
+                d = (x - denoised) / (2 * sigmas[i])
+            else:
+                d = (x - denoised) / sigmas[i - 1]
+
+            dt = sigmas[i] - sigmas[i - 1]
+            x = x + d * dt
+
+            sd_samplers_common.store_latent(x)
+
+            # This shouldn't be necessary, but solved some VRAM issues
+            del x_in, sigma_in, cond_in, c_out, c_in, t,
+            del eps, denoised_uncond, denoised_cond, denoised, d, dt
+
+        shared.state.nextjob()
+
+        return x / sigmas[-1]
 
 class VideoVeilSourceVideo:
     def __init__(
@@ -380,6 +438,38 @@ class Script(scripts.Script):
             self.img2img_h_slider = component
             return self.img2img_h_slider
 
+    def apply_img2img_alternate_fix(
+            self,
+            cp,
+            frame: VideoVeilImage,
+            prompt_describing_original_video: str,
+            neg_prompt_describing_original_video: str,
+    ):
+        cp.batch_size = 1
+        cp.sampler_name = "Euler"
+
+        def sample_extra(conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
+            shared.state.job_count += 1
+            decode_cfg_scale = 1.0
+            cond = cp.sd_model.get_learned_conditioning([prompt_describing_original_video])
+            uncond = cp.sd_model.get_learned_conditioning([neg_prompt_describing_original_video])
+            rec_noise = frame.find_noise_for_image_sigma_adjustment(
+                p=cp,
+                cond=cond,
+                uncond=uncond,
+                cfg_scale=decode_cfg_scale,
+                steps=cp.steps
+            )
+
+            sampler = sd_samplers.create_sampler(cp.sampler_name, cp.sd_model)
+            sigmas = sampler.model_wrap.get_sigmas(cp.steps)
+            noise_dt = rec_noise - (cp.init_latent / sigmas[0])
+            # cp.seed = cp.seed + 1
+
+            return sampler.sample_img2img(cp, cp.init_latent, noise_dt, conditioning, unconditional_conditioning, image_conditioning=cp.image_conditioning)
+
+        cp.sample = sample_extra
+
     """
     This function is called if the script has been selected in the script dropdown.
     It must do all processing and return the Processed object with results, same as
@@ -427,10 +517,19 @@ class Script(scripts.Script):
                     if state.skipped: state.skipped = False
                     if state.interrupted: break
 
-                    # TODO: Plumb into Auto1111 progress indicators
                     state.job = f"{state.job_no + 1} out of {state.job_count}"
 
                     cp = copy.copy(p)
+
+                    # Img2Img Alternate fixes - TODO: Lock behind a checkbox
+                    self.apply_img2img_alternate_fix(
+                        cp=cp,
+                        frame=frame,
+                        # TODO: Accept these as input
+                        prompt_describing_original_video="This prompt should describe your input video",
+                        neg_prompt_describing_original_video="This is your negative prompt describing your input video"
+                    )
+
 
                     # Set the ControlNet reference image
                     cp.control_net_input_image = [frame.frame_array]
