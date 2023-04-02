@@ -79,6 +79,13 @@ class VideoVeilSourceVideo:
                 self._load_frames_from_video()
                 self._set_video_dimensions()
 
+
+    def transformed_frames(self) -> list[Image]:
+        return [
+            frame.transformed_image for frame in self.frames
+            if frame.transformed_image is not None
+        ]
+
     def create_mp4(self, seed: int, output_directory: str, img2img_gallery=None):
         if self.test_run:
             return
@@ -108,8 +115,8 @@ class VideoVeilSourceVideo:
             out = cv2.VideoWriter(output_path, fourcc, fps, (self.video_width, self.video_height))
 
             # write the images to the video file
-            for frame in self.frames:
-                out.write(cv2.cvtColor(np.array(frame.transformed_image), cv2.COLOR_RGB2BGR))
+            for image in self.transformed_frames():
+                out.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
 
             out.release()
 
@@ -457,7 +464,7 @@ class Script(scripts.Script):
                     cp.close()
 
                 # Show the user what we generated
-                proc.images = [frame.transformed_image for frame in source_video.frames]
+                proc.images = source_video.transformed_frames()
 
                 # now create a video
                 source_video.create_mp4(seed=proc.seed, output_directory=cp.outpath_samples, img2img_gallery=self.img2img_gallery)
