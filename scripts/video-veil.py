@@ -46,15 +46,17 @@ class VideoVeilSourceVideo:
             use_images_directory: bool,
             video_path: str,
             directory_upload_path: str,
+            only_process_every_x_frames: int,
             test_run: bool,
             test_run_frames_count: int,
-            throw_errors_when_invalid: bool = True,
+            throw_errors_when_invalid: bool,
     ):
         self.frames: list[VideoVeilImage] = []
 
         self.use_images_directory: bool = use_images_directory
         self.video_path: str = video_path
         self.directory_upload_path: str = directory_upload_path
+        self.only_process_every_x_frames = only_process_every_x_frames
         self.test_run: bool = test_run
         self.test_run_frames_count: int = None if not test_run else test_run_frames_count
         self.output_video_path: str = None
@@ -140,37 +142,43 @@ class VideoVeilSourceVideo:
         # Open the images and convert them to np.ndarray
         for i, image_name in enumerate(image_names):
 
-            if self.test_run_frames_count is not None and len(self.frames) >= self.test_run_frames_count:
+            if self.test_run and self.test_run_frames_count is not None and len(self.frames) >= self.test_run_frames_count:
                 return
 
-            image_path = os.path.join(self.directory_upload_path, image_name)
+            if i == 0 or ((i + 1) % self.only_process_every_x_frames == 0):
+                image_path = os.path.join(self.directory_upload_path, image_name)
 
-            # Convert the image
-            image = Image.open(image_path)
+                # Convert the image
+                image = Image.open(image_path)
 
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
+                if not image.mode == "RGB":
+                    image = image.convert("RGB")
 
-            self.frames.append(VideoVeilImage(frame_image=image))
+                self.frames.append(VideoVeilImage(frame_image=image))
 
         return
 
     def _load_frames_from_video(self):
         cap = cv2.VideoCapture(self.video_path)
         self.frames = []
+
+        i = 0
         if not cap.isOpened():
             return
         while True:
-            if self.test_run_frames_count is not None and len(self.frames) >= self.test_run_frames_count:
+            if self.test_run and self.test_run_frames_count is not None and len(self.frames) >= self.test_run_frames_count:
                 cap.release()
                 return
 
             ret, frame = cap.read()
             if ret:
-                self.frames.append(VideoVeilImage(frame_array=frame))
+                if i == 0 or ((i + 1) % self.only_process_every_x_frames == 0):
+                    self.frames.append(VideoVeilImage(frame_array=frame))
             else:
                 cap.release()
                 return
+
+            i += 1
 
         return
 
@@ -214,13 +222,10 @@ class Script(scripts.Script):
             # Input type selection row, allow the user to choose their input type (*.MP4 file or Directory Path)
             with gr.Row():
                 use_images_directory_gr = gr.Checkbox(label=f"Use Directory", value=False, elem_id=f"vv_use_directory_for_video", info="Use Directory of images instead of *.mp4 file")
-                gr.HTML("<br />")
-
 
             # Video Uploader Row
             with gr.Row() as video_uploader_row:
                 video_path_gr = gr.Video(format='mp4', source='upload', elem_id=f"vv_video_path")
-                gr.HTML("<br />")
 
             # Directory Path Row
             with gr.Row(visible=False) as directory_uploader_row:
@@ -231,7 +236,6 @@ class Script(scripts.Script):
                     interactive=True,
                     info="Path to directory containing your individual frames for processing."
                 )
-                gr.HTML("<br />")
 
             # Video Source Info Row
             with gr.Row():
@@ -247,10 +251,22 @@ class Script(scripts.Script):
                     interactive=True,
                 )
 
+            # Frame Skip
+            with gr.Row():
+                only_process_every_x_frames_gr = gr.Slider(
+                    label="Only Process every (x) frames",
+                    info="1 will process every frame, 2 will process every other frame, 4 will process every 4th frame, etc",
+                    value=1,
+                    minimum=1,
+                    maximum=100,
+                    step=1,
+                    elem_id="vv_only_process_every_x_frames",
+                    interactive=True,
+                )
+
             # Test Processing Row
             with gr.Row():
                 test_run_gr = gr.Checkbox(label=f"Test Run", value=False, elem_id=f"vv_test_run")
-                gr.HTML("<br />")
 
             with gr.Row(visible=False) as test_run_parameters_row:
                 test_run_frames_count_gr = gr.Slider(
@@ -275,6 +291,7 @@ class Script(scripts.Script):
                     use_images_directory=use_directory_for_video,
                     video_path=video_path,
                     directory_upload_path=directory_upload_path,
+                    only_process_every_x_frames=1,
                     test_run=True,
                     test_run_frames_count=1,
                     throw_errors_when_invalid=False
@@ -363,6 +380,7 @@ class Script(scripts.Script):
             video_path_gr,
             directory_upload_path_gr,
             color_correction_gr,
+            only_process_every_x_frames_gr,
             test_run_gr,
             test_run_frames_count_gr,
         )
@@ -401,6 +419,7 @@ class Script(scripts.Script):
             video_path: str,
             directory_upload_path: str,
             color_correction: str,
+            only_process_every_x_frames: int,
             test_run: bool,
             test_run_frames_count: int,
     ):
@@ -414,11 +433,14 @@ class Script(scripts.Script):
                 use_images_directory=use_images_directory,
                 video_path=video_path,
                 directory_upload_path=directory_upload_path,
+                only_process_every_x_frames=only_process_every_x_frames,
                 test_run=test_run,
                 test_run_frames_count=test_run_frames_count,
+                throw_errors_when_invalid=True
             )
 
             print(f"color_correction: {color_correction}")
+            print(f"only_process_every_x_frames: {only_process_every_x_frames}")
             print(f"test_run: {test_run}")
             print(f"test_run_frames_count: {test_run_frames_count}")
             print(f"# of frames: {len(source_video.frames)}")
