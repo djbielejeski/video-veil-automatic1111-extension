@@ -6,14 +6,16 @@ import cv2
 import numpy as np
 import gradio as gr
 from PIL import Image
-import modules.scripts as scripts
+from tqdm import trange
 from datetime import datetime, timezone
 
-from modules import images
+import modules.scripts as scripts
+from modules import processing, shared, images, sd_samplers, sd_samplers_common
 from modules.processing import process_images, setup_color_correction
-from modules.shared import opts
-import modules.generation_parameters_copypaste as parameters_copypaste
+from modules.shared import opts, cmd_opts, state, sd_model
 
+import torch
+import k_diffusion as K
 
 color_correction_option_none = 'None'
 color_correction_option_video = 'From Source Video'
@@ -223,6 +225,47 @@ class Script(scripts.Script):
 
         return frames
 
+    def find_noise_for_image(self, p, cond, uncond, cfg_scale, steps):
+        x = p.init_latent
+
+        s_in = x.new_ones([x.shape[0]])
+        dnw = K.external.CompVisDenoiser(shared.sd_model)
+        sigmas = dnw.get_sigmas(steps).flip(0)
+
+        state.sampling_steps = steps
+
+        for i in trange(1, len(sigmas)):
+            state.sampling_step += 1
+
+            x_in = torch.cat([x] * 2)
+            sigma_in = torch.cat([sigmas[i] * s_in] * 2)
+            cond_in = torch.cat([uncond, cond])
+
+            image_conditioning = torch.cat([p.image_conditioning] * 2)
+            cond_in = {"c_concat": [image_conditioning], "c_crossattn": [cond_in]}
+
+            c_out, c_in = [K.utils.append_dims(k, x_in.ndim) for k in dnw.get_scalings(sigma_in)]
+            t = dnw.sigma_to_t(sigma_in)
+
+            eps = shared.sd_model.apply_model(x_in * c_in, t, cond=cond_in)
+            denoised_uncond, denoised_cond = (x_in + eps * c_out).chunk(2)
+
+            denoised = denoised_uncond + (denoised_cond - denoised_uncond) * cfg_scale
+
+            d = (x - denoised) / sigmas[i]
+            dt = sigmas[i] - sigmas[i - 1]
+
+            x = x + d * dt
+
+            sd_samplers_common.store_latent(x)
+
+            # This shouldn't be necessary, but solved some VRAM issues
+            del x_in, sigma_in, cond_in, c_out, c_in, t,
+            del eps, denoised_uncond, denoised_cond, denoised, d, dt
+
+        state.nextjob()
+
+        return x / x.std()
 
 
     # This is where the additional processing is implemented. The parameters include
@@ -254,7 +297,6 @@ class Script(scripts.Script):
         )
 
 
-
         print(f"color_correction: {color_correction}")
 
         print(f"test_run: {test_run}")
@@ -264,13 +306,48 @@ class Script(scripts.Script):
 
 
         if len(frames) > 0:
+            state.job_count = len(frames)
+            state.job_no = 0
+
             output_image_list = []
             height, width, _ = frames[0].shape
 
             # Loop over all the frames and process them
             for i, frame in enumerate(frames):
                 # TODO: Plumb into Auto1111 progress indicators
+                state.job_no = i
+
                 cp = copy.copy(p)
+
+                # probably should set batch size to 1 here manually
+                cp.batch_size = 1
+
+                # overrides for reverse sampling
+                cp.sampler_name = "Euler"
+                cp.denoising_strength = 1.0
+
+                custom_cfg_scale = 2.0
+                original_cfg_scale = cp.cfg_scale
+                cp.cfg_scale = custom_cfg_scale
+
+                # Modified from img2imgalt in Automatic1111
+                def sample_extra(conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
+                    shared.state.job_count += 1
+                    cond = cp.sd_model.get_learned_conditioning(cp.batch_size * [cp.prompt])
+                    uncond = cp.sd_model.get_learned_conditioning(cp.batch_size * [cp.negative_prompt])
+
+                    # this could potentially be
+                    # noise = cp.sample(cp, rand_noise, cond, uncond, image_conditioning=cp.image_conditioning)
+                    noise = self.find_noise_for_image(cp, cond, uncond, original_cfg_scale, cp.steps)
+                    sampler = sd_samplers.create_sampler(cp.sampler_name, cp.sd_model)
+                    sigmas = sampler.model_wrap.get_sigmas(cp.steps)
+                    noise_dt = noise - (cp.init_latent / sigmas[0])
+                    # cp.seed = cp.seed + 1
+
+                    return sampler.sample_img2img(cp, cp.init_latent, noise_dt, conditioning, unconditional_conditioning, image_conditioning=cp.image_conditioning)
+
+                # setup the sampler to use the input image as our noise
+                cp.sample = sample_extra
 
                 # set the dimensions on the image
                 cp.height = height
@@ -310,36 +387,37 @@ class Script(scripts.Script):
             proc.images = output_image_list
 
             # now create a video
+            if not test_run:
 
-            # get the original file name, and slap a timestamp on it
-            original_file_name: str = ""
-            fps = 30 # TODO: Add this as an option when they pick a folder
-            if not use_images_directory:
-                original_file_name = os.path.basename(video_path)
-                clip = cv2.VideoCapture(video_path)
-                if clip:
-                    fps = clip.get(cv2.CAP_PROP_FPS)
-                    clip.release()
-            else:
-                original_file_name = f"{os.path.basename(directory_upload_path)}.mp4"
+                # get the original file name, and slap a timestamp on it
+                original_file_name: str = ""
+                fps = 30 # TODO: Add this as an option when they pick a folder
+                if not use_images_directory:
+                    original_file_name = os.path.basename(video_path)
+                    clip = cv2.VideoCapture(video_path)
+                    if clip:
+                        fps = clip.get(cv2.CAP_PROP_FPS)
+                        clip.release()
+                else:
+                    original_file_name = f"{os.path.basename(directory_upload_path)}.mp4"
 
-            date_string = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-            file_name = f"{date_string}-{proc.seed}-{original_file_name}"
+                date_string = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+                file_name = f"{date_string}-{proc.seed}-{original_file_name}"
 
-            output_directory = os.path.join(p.outpath_samples, "video-veil-output")
-            os.makedirs(output_directory, exist_ok=True)
-            output_path = os.path.join(output_directory, file_name)
+                output_directory = os.path.join(cp.outpath_samples, "video-veil-output")
+                os.makedirs(output_directory, exist_ok=True)
+                output_path = os.path.join(output_directory, file_name)
 
-            print(f"Saving *.mp4 to: {output_path}")
+                print(f"Saving *.mp4 to: {output_path}")
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-            # write the images to the video file
-            for image in output_image_list:
-                out.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
+                # write the images to the video file
+                for image in output_image_list:
+                    out.write(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
 
-            out.release()
+                out.release()
 
         else:
             proc = process_images(p)
