@@ -183,7 +183,7 @@ class VideoVeilSourceVideo:
         return
 
     def _set_video_dimensions(self):
-        if len(self.frames):
+        if len(self.frames) > 0:
             first_frame = self.frames[0]
             self.video_width, self.video_height = first_frame.width, first_frame.height
 
