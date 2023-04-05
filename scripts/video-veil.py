@@ -7,12 +7,27 @@ import numpy as np
 import gradio as gr
 from PIL import Image
 from datetime import datetime, timezone
+import importlib
 
 import modules.scripts as scripts
 from modules import processing, shared, script_callbacks, images, sd_samplers, sd_samplers_common
 from modules.processing import process_images, setup_color_correction
 from modules.shared import opts, cmd_opts, state, sd_model
 
+controlnet_external_code = None
+controlnet_global_state = None
+controlnet_preprocessors = None
+controlnet_HWC3 = None
+ControlNetUnit = None
+try:
+    controlnet_external_code = importlib.import_module('extensions.sd-webui-controlnet.scripts.external_code', 'external_code')
+    ControlNetUnit = controlnet_external_code.ControlNetUnit
+    controlnet_annotator_util = importlib.import_module('extensions.sd-webui-controlnet.annotator.util', 'util')
+    controlnet_HWC3 = controlnet_annotator_util.HWC3
+    controlnet_global_state = importlib.import_module('extensions.sd-webui-controlnet.scripts.global_state', 'global_state')
+    controlnet_preprocessors = controlnet_global_state.cn_preprocessor_modules
+except ImportError:
+    pass
 
 color_correction_option_none = 'None'
 color_correction_option_video = 'From Source Video'
@@ -24,11 +39,13 @@ color_correction_options = [
     color_correction_option_generated_image,
 ]
 
+
 class VideoVeilImage:
     def __init__(self, frame_array: np.ndarray = None, frame_image: Image = None):
         self.frame_array = frame_array
         self.frame_image = frame_image
         self.transformed_image: Image = None
+        self.controlnet_images: list[np.ndarray] = []
 
         if frame_array is not None:
             converted_frame_array = cv2.cvtColor(self.frame_array, cv2.COLOR_BGR2RGB)
@@ -62,6 +79,7 @@ class VideoVeilSourceVideo:
         self.output_video_path: str = None
         self.video_width: int = 0
         self.video_height: int = 0
+        self.controlnet_units: list[ControlNetUnit] = []
 
 
         if use_images_directory:
@@ -81,12 +99,73 @@ class VideoVeilSourceVideo:
                 self._load_frames_from_video()
                 self._set_video_dimensions()
 
-
     def transformed_frames(self) -> list[Image]:
         return [
             frame.transformed_image for frame in self.frames
             if frame.transformed_image is not None
         ]
+
+    def controlnet_images(self) -> list[np.ndarray]:
+        cn_images: list[np.ndarray] = []
+
+        for frame in self.frames:
+            for cn_image in frame.controlnet_images:
+                cn_images.append(cn_image)
+
+        return cn_images
+
+    def _load_controlnets(self, p):
+        self.controlnet_units: list[ControlNetUnit] = []
+        if controlnet_external_code is not None:
+            self.controlnet_units = [
+                cn_unit for cn_unit in controlnet_external_code.get_all_units_in_processing(p)
+                if cn_unit.enabled
+            ]
+
+            print(f"Found {len(self.controlnet_units)} enabled controlnets")
+            for cn_unit in self.controlnet_units:
+                print(f"Controlnet: {cn_unit.module}[{cn_unit.model}]")
+
+
+    def preprocess_controlnets(self, p):
+        self._load_controlnets(p)
+
+        if len(self.controlnet_units) > 0:
+            print(f"Pre-processing controlnets. {len(self.controlnet_units)} active.")
+            # TODO: Maybe add a progress indicator here
+            for cn_unit in self.controlnet_units:
+                for i, frame in enumerate(self.frames):
+                    # Note: Not capturing masks
+                    cn_image: np.ndarray = self._run_controlnet_annotator(
+                        image=frame.frame_array,
+                        module=cn_unit.module,
+                        processor_res=cn_unit.processor_res,
+                        threshold_a=cn_unit.threshold_a,
+                        threshold_b=cn_unit.threshold_b,
+                    )
+                    if cn_image is not None:
+                        frame.controlnet_images.append(cn_image)
+
+    def _run_controlnet_annotator(
+            self,
+            image: np.ndarray,
+            module: str,
+            processor_res: int,
+            threshold_a: int,
+            threshold_b: int
+    ) -> np.ndarray:
+        img = controlnet_HWC3(image)
+        preprocessor = controlnet_preprocessors[module]
+        result = None
+        if processor_res > 64:
+            result, is_image = preprocessor(img, res=processor_res, thr_a=threshold_a, thr_b=threshold_b)
+        else:
+            result, is_image = preprocessor(img)
+
+        if is_image:
+            return result
+        else:
+            return None
 
     def create_mp4(self, seed: int, output_directory: str, img2img_gallery=None):
         if self.test_run:
@@ -183,7 +262,7 @@ class VideoVeilSourceVideo:
         return
 
     def _set_video_dimensions(self):
-        if len(self.frames):
+        if len(self.frames) > 0:
             first_frame = self.frames[0]
             self.video_width, self.video_height = first_frame.width, first_frame.height
 
@@ -213,36 +292,41 @@ class Script(scripts.Script):
         # control_net_models_count = opts.data.get("control_net_max_models_num", 1)
         # control_net_allow_script_control = opts.data.get("control_net_allow_script_control", False)
 
-        with gr.Group(elem_id="vv_accordion"):
-            with gr.Row():
-                gr.HTML("<br /><h1 style='border-bottom: 1px solid #eee;'>Video Veil</h1>")
-            with gr.Row():
-                gr.HTML("<div><a style='color: #0969da;' href='https://github.com/djbielejeski/video-veil-automatic1111-extension' target='_blank'>Video-Veil Github</a></div>")
+        gr.HTML("<h1 style='border-bottom: 1px solid #eee; margin: 12px 0px 8px !important'>Video Veil</h1>")
+        gr.HTML("<div><a style='color: #0969da;' href='https://github.com/djbielejeski/video-veil-automatic1111-extension' target='_blank'>Video-Veil Github</a></div>")
 
-            # Input type selection row, allow the user to choose their input type (*.MP4 file or Directory Path)
-            with gr.Row():
-                use_images_directory_gr = gr.Checkbox(label=f"Use Directory", value=False, elem_id=f"vv_use_directory_for_video", info="Use Directory of images instead of *.mp4 file")
+        # Input type selection row, allow the user to choose their input type (*.MP4 file or Directory Path)
+        use_images_directory_gr = gr.Checkbox(
+            label=f"Use Directory",
+            value=False,
+            elem_id=f"vv_use_directory_for_video",
+            info="Use Directory of images instead of *.mp4 file"
+        )
 
-            # Video Uploader Row
-            with gr.Row() as video_uploader_row:
-                video_path_gr = gr.Video(format='mp4', source='upload', elem_id=f"vv_video_path")
+        # Spacer
+        gr.HTML("<div style='margin: 16px 0px !important; border-bottom: 1px solid #eee;'></div>")
 
-            # Directory Path Row
-            with gr.Row(visible=False) as directory_uploader_row:
-                directory_upload_path_gr = gr.Textbox(
-                    label="Directory",
-                    value="",
-                    elem_id="vv_video_directory",
-                    interactive=True,
-                    info="Path to directory containing your individual frames for processing."
-                )
+        # Video Uploader Row
+        video_path_gr = gr.Video(format='mp4', source='upload', elem_id=f"vv_video_path")
 
-            # Video Source Info Row
-            with gr.Row():
-                video_source_info_gr = gr.HTML("")
+        # Directory Path Row
+        directory_upload_path_gr = gr.Textbox(
+            label="Directory",
+            value="",
+            elem_id="vv_video_directory",
+            interactive=True,
+            visible=False,
+            info="Path to directory containing your individual frames for processing."
+        )
 
-            # Color Correction
-            with gr.Row():
+        # Video Source Info Row
+        video_source_info_gr = gr.HTML("")
+
+        gr.HTML("<div style='margin: 16px 0px !important; border-bottom: 1px solid #eee;'></div>")
+
+        with gr.Row():
+            with gr.Column():
+                # Color Correction
                 color_correction_gr = gr.Dropdown(
                     label="Color Correction",
                     choices=color_correction_options,
@@ -251,11 +335,10 @@ class Script(scripts.Script):
                     interactive=True,
                 )
 
-            # Frame Skip
-            with gr.Row():
+            with gr.Column():
+                # Frame Skip
                 only_process_every_x_frames_gr = gr.Slider(
                     label="Only Process every (x) frames",
-                    info="1 will process every frame, 2 will process every other frame, 4 will process every 4th frame, etc",
                     value=1,
                     minimum=1,
                     maximum=100,
@@ -263,117 +346,109 @@ class Script(scripts.Script):
                     elem_id="vv_only_process_every_x_frames",
                     interactive=True,
                 )
+                gr.HTML("<div style='color: #777; font-size: 12px'>1 will process every frame, 2 will process every other frame, 4 will process every 4th frame, etc</div>")
 
-            # Test Processing Row
-            with gr.Row():
+        gr.HTML("<div style='margin: 16px 0px !important; border-bottom: 1px solid #eee;'></div>")
+
+        # Test Processing Row
+        with gr.Row():
+            with gr.Column():
                 test_run_gr = gr.Checkbox(label=f"Test Run", value=False, elem_id=f"vv_test_run")
-
-            with gr.Row(visible=False) as test_run_parameters_row:
+            with gr.Column(visible=False) as test_run_parameters_container:
                 test_run_frames_count_gr = gr.Slider(
-                                label="# of frames to test",
-                                value=1,
-                                minimum=1,
-                                maximum=100,
-                                step=1,
-                                elem_id="vv_test_run_frames_count",
-                                interactive=True,
-                            )
-
-            # Click handlers and UI Updaters
-
-            # If the user selects a video or directory, update the img2img sections
-            def video_src_change(
-                    use_directory_for_video: bool,
-                    video_path: str,
-                    directory_upload_path: str,
-            ):
-                temp_video = VideoVeilSourceVideo(
-                    use_images_directory=use_directory_for_video,
-                    video_path=video_path,
-                    directory_upload_path=directory_upload_path,
-                    only_process_every_x_frames=1,
-                    test_run=True,
-                    test_run_frames_count=1,
-                    throw_errors_when_invalid=False
+                    label="# of frames to test",
+                    value=1,
+                    minimum=1,
+                    maximum=100,
+                    step=1,
+                    elem_id="vv_test_run_frames_count",
+                    interactive=True,
                 )
-
-                if len(temp_video.frames) > 0:
-                    # Update the img2img settings via the existing Gradio controls
-                    first_frame = temp_video.frames[0]
-
-                    return {
-                        self.img2img_component: gr.update(value=first_frame.frame_image),
-                        self.img2img_w_slider: gr.update(value=first_frame.width),
-                        self.img2img_h_slider: gr.update(value=first_frame.height),
-                        video_source_info_gr: gr.update(value=f"<div style='color: #333'>Video Frames found: {first_frame.width}x{first_frame.height}px</div>")
-                    }
-                else:
-                    error_message = "" if video_path is None or directory_upload_path is None or directory_upload_path == "" else "Invalid source, unable to parse video frames from input."
-                    return {
-                        self.img2img_component: gr.update(value=None),
-                        self.img2img_w_slider: gr.update(value=512),
-                        self.img2img_h_slider: gr.update(value=512),
-                        video_source_info_gr: gr.update(value=f"<div style='color: red'>{error_message}</div>")
-                    }
-
-            source_inputs = [
-                video_path_gr,
-                directory_upload_path_gr,
-            ]
-
-            for source_input in source_inputs:
-                source_input.change(
-                    fn=video_src_change,
-                    inputs=[
-                        use_images_directory_gr,
-                        video_path_gr,
-                        directory_upload_path_gr,
-                    ],
-                    outputs=[
-                        self.img2img_component,
-                        self.img2img_w_slider,
-                        self.img2img_h_slider,
-                        video_source_info_gr,
-                    ]
-                )
-
-            # Upload type change
-            def change_upload_type_click(
-                use_directory_for_video: bool
-            ):
-                return {
-                    video_uploader_row: gr.update(visible=not use_directory_for_video),
-                    directory_uploader_row: gr.update(visible=use_directory_for_video),
-                }
-
-            use_images_directory_gr.change(
-                fn=change_upload_type_click,
-                inputs=[
-                    use_images_directory_gr
-                ],
-                outputs=[
-                    video_uploader_row,
-                    directory_uploader_row
-                ]
-            )
 
             # Test run change
-            def test_run_click(
-                    is_test_run: bool
-            ):
+            def test_run_click(is_test_run: bool):
+                return gr.update(visible=is_test_run)
+
+            test_run_gr.change(fn=test_run_click, inputs=test_run_gr, outputs=test_run_parameters_container)
+
+
+        # Click handlers and UI Updaters
+
+        # If the user selects a video or directory, update the img2img sections
+        def video_src_change(
+                use_directory_for_video: bool,
+                video_path: str,
+                directory_upload_path: str,
+        ):
+            temp_video = VideoVeilSourceVideo(
+                use_images_directory=use_directory_for_video,
+                video_path=video_path,
+                directory_upload_path=directory_upload_path,
+                only_process_every_x_frames=1,
+                test_run=True,
+                test_run_frames_count=1,
+                throw_errors_when_invalid=False
+            )
+
+            if len(temp_video.frames) > 0:
+                # Update the img2img settings via the existing Gradio controls
+                first_frame = temp_video.frames[0]
+
                 return {
-                    test_run_parameters_row: gr.update(visible=is_test_run)
+                    self.img2img_component: gr.update(value=first_frame.frame_image),
+                    self.img2img_w_slider: gr.update(value=first_frame.width),
+                    self.img2img_h_slider: gr.update(value=first_frame.height),
+                    video_source_info_gr: gr.update(value=f"<div style='color: #333'>Video Frames found: {first_frame.width}x{first_frame.height}px</div>")
+                }
+            else:
+                error_message = "" if video_path is None or directory_upload_path is None or directory_upload_path == "" else "Invalid source, unable to parse video frames from input."
+                return {
+                    self.img2img_component: gr.update(value=None),
+                    self.img2img_w_slider: gr.update(value=512),
+                    self.img2img_h_slider: gr.update(value=512),
+                    video_source_info_gr: gr.update(value=f"<div style='color: red'>{error_message}</div>")
                 }
 
-            test_run_gr.change(
-                fn=test_run_click,
+        source_inputs = [
+            video_path_gr,
+            directory_upload_path_gr,
+        ]
+
+        for source_input in source_inputs:
+            source_input.change(
+                fn=video_src_change,
                 inputs=[
-                    test_run_gr
+                    use_images_directory_gr,
+                    video_path_gr,
+                    directory_upload_path_gr,
                 ],
                 outputs=[
-                    test_run_parameters_row
+                    self.img2img_component,
+                    self.img2img_w_slider,
+                    self.img2img_h_slider,
+                    video_source_info_gr,
                 ]
             )
+
+        # Upload type change
+        def change_upload_type_click(
+            use_directory_for_video: bool
+        ):
+            return {
+                video_path_gr: gr.update(visible=not use_directory_for_video),
+                directory_upload_path_gr: gr.update(visible=use_directory_for_video),
+            }
+
+        use_images_directory_gr.change(
+            fn=change_upload_type_click,
+            inputs=[
+                use_images_directory_gr
+            ],
+            outputs=[
+                video_path_gr,
+                directory_upload_path_gr
+            ]
+        )
 
         return (
             use_images_directory_gr,
@@ -449,18 +524,23 @@ class Script(scripts.Script):
                 state.job_count = len(source_video.frames) * p.n_iter
                 state.job_no = 0
 
+                # Pre-process controlnets for speeeeeeeed
+                source_video.preprocess_controlnets(p)
+
                 # Loop over all the frames and process them
                 for i, frame in enumerate(source_video.frames):
                     if state.skipped: state.skipped = False
                     if state.interrupted: break
 
-                    # TODO: Plumb into Auto1111 progress indicators
+                    # Progress indicator
                     state.job = f"{state.job_no + 1} out of {state.job_count}"
 
                     cp = copy.copy(p)
 
-                    # Set the ControlNet reference image
-                    cp.control_net_input_image = [frame.frame_array]
+                    # Set the ControlNet reference images
+                    # cp.control_net_input_image = [frame.frame_array]
+                    for cn_index, cn_image in enumerate(frame.controlnet_images):
+                        source_video.controlnet_units[cn_index].image = cn_image
 
                     # Set the Img2Img reference image to the frame of the video
                     cp.init_images = [frame.frame_image]
@@ -488,9 +568,14 @@ class Script(scripts.Script):
                 # Show the user what we generated
                 proc.images = source_video.transformed_frames()
 
+                if test_run:
+                    for cn_image in source_video.controlnet_images():
+                        proc.images.append(cn_image)
+
                 # now create a video
                 source_video.create_mp4(seed=proc.seed, output_directory=cp.outpath_samples, img2img_gallery=self.img2img_gallery)
 
+                del source_video
         else:
             proc = process_images(p)
 
