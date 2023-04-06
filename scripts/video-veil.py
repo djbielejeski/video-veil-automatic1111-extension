@@ -124,6 +124,7 @@ class VideoVeilSourceVideo:
 
             print(f"Found {len(self.controlnet_units)} enabled controlnets")
             for cn_unit in self.controlnet_units:
+                # Controlnet: openpose[controlnetPreTrained_openposeDifferenceV1 [1723948e]]
                 print(f"Controlnet: {cn_unit.module}[{cn_unit.model}]")
 
 
@@ -145,6 +146,9 @@ class VideoVeilSourceVideo:
                     )
                     if cn_image is not None:
                         frame.controlnet_images.append(cn_image)
+
+                # turn off the module for the controlnet, since we've already processed the images
+                cn_unit.module = "none"
 
     def _run_controlnet_annotator(
             self,
@@ -538,9 +542,8 @@ class Script(scripts.Script):
                     cp = copy.copy(p)
 
                     # Set the ControlNet reference images
-                    # cp.control_net_input_image = [frame.frame_array]
                     for cn_index, cn_image in enumerate(frame.controlnet_images):
-                        source_video.controlnet_units[cn_index].image = cn_image
+                        source_video.controlnet_units[cn_index].image = {'image': cn_image, 'mask': None}
 
                     # Set the Img2Img reference image to the frame of the video
                     cp.init_images = [frame.frame_image]
@@ -576,6 +579,7 @@ class Script(scripts.Script):
                 source_video.create_mp4(seed=proc.seed, output_directory=cp.outpath_samples, img2img_gallery=self.img2img_gallery)
 
                 del source_video
+                cv2.destroyAllWindows()
         else:
             proc = process_images(p)
 
