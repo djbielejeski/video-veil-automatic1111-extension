@@ -80,6 +80,7 @@ class VideoVeilSourceVideo:
         self.video_width: int = 0
         self.video_height: int = 0
         self.controlnet_units: list[ControlNetUnit] = []
+        self.controlnet_modules: list[str] = []
 
 
         if use_images_directory:
@@ -124,8 +125,8 @@ class VideoVeilSourceVideo:
 
             print(f"Found {len(self.controlnet_units)} enabled controlnets")
             for cn_unit in self.controlnet_units:
-                # Controlnet: openpose[controlnetPreTrained_openposeDifferenceV1 [1723948e]]
-                print(f"Controlnet: {cn_unit.module}[{cn_unit.model}]")
+                # Controlnet: openpose->controlnetPreTrained_openposeDifferenceV1 [1723948e]
+                print(f"Controlnet: {cn_unit.module}->{cn_unit.model}")
 
 
     def preprocess_controlnets(self, p):
@@ -148,6 +149,7 @@ class VideoVeilSourceVideo:
                         frame.controlnet_images.append(cn_image)
 
                 # turn off the module for the controlnet, since we've already processed the images
+                self.controlnet_modules.append(cn_unit.module)
                 cn_unit.module = "none"
 
     def _run_controlnet_annotator(
@@ -210,6 +212,12 @@ class VideoVeilSourceVideo:
                 img2img_gallery.update([output_path])
 
         return
+
+    def cleanup(self):
+        # Reset the controlnet modules
+        for i, module in enumerate(self.controlnet_modules):
+            self.controlnet_units[i].module = module
+
 
     def _load_frames_from_folder(self):
         image_extensions = ['.jpg', '.jpeg', '.png']
@@ -577,6 +585,7 @@ class Script(scripts.Script):
 
                 # now create a video
                 source_video.create_mp4(seed=proc.seed, output_directory=cp.outpath_samples, img2img_gallery=self.img2img_gallery)
+                source_video.cleanup()
 
                 del source_video
                 cv2.destroyAllWindows()
