@@ -3,7 +3,7 @@ import copy
 import cv2
 import gradio as gr
 
-from scripts.source_video import VideoVeilSourceVideo
+from scripts.source_video import VideoVeilSourceVideo, VideoVeilSourceVideoFrame
 from scripts.controlnet_integration import controlnet_external_code
 
 update_cn_script_in_processing = controlnet_external_code.update_cn_script_in_processing
@@ -31,6 +31,13 @@ class Script(scripts.Script):
         self.img2img_gallery = gr.Gallery()
         self.img2img_w_slider = gr.Slider()
         self.img2img_h_slider = gr.Slider()
+
+        # might be able to save cnet settings like this
+        #x = copy(scripts.scripts_img2img)
+        #print(x)
+
+        # external_code_test.py
+        # external_code.update_cn_script_in_place(self.scripts, self.script_args, self.cn_units)
 
     def title(self):
         return "Video-Veil"
@@ -132,38 +139,80 @@ class Script(scripts.Script):
 
             test_run_gr.change(fn=test_run_click, inputs=test_run_gr, outputs=test_run_parameters_container)
 
+
+        gr.HTML("<div style='margin: 16px 0px !important; border-bottom: 1px solid #eee;'></div>")
+
+        # Frames to Grid Row
+        with gr.Row():
+            with gr.Column():
+                frames_to_grids_gr = gr.Checkbox(
+                    label=f"Process frames as a grid",
+                    value=False,
+                    elem_id=f"vv_frames_to_grid_checkbox",
+                    interactive=True,
+                    info="Extracts all of the frames, and puts them in a grid, then processes the grid via img2img + control net.  Improves consistency, uses lots of VRAM."
+                )
+            with gr.Column(visible=False) as frames_to_grids_options_container:
+                frames_per_grid_gr = gr.Radio(
+                    ["2x2", "2x3", "3x2", "3x3", "3x4", "4x3", "4x4", "4x5", "5x4", "5x5"],
+                    value="2x2",
+                    label="Grid Size",
+                    elem_id=f"vv_frames_per_grid_radio_buttons",
+                    interactive=True,
+                    info="How many images per grid",
+                )
+
+        def frames_to_grids_change(is_frames_to_grids: bool):
+            return gr.update(visible=is_frames_to_grids)
+
+        # Grids Checkbox Checked
+        frames_to_grids_gr.change(
+            fn=frames_to_grids_change,
+            inputs=frames_to_grids_gr,
+            outputs=frames_to_grids_options_container
+        )
+
         # Click handlers and UI Updaters
 
         # If the user selects a video or directory, update the img2img sections
         def video_src_change(
-                use_directory_for_video: bool,
+                use_images_directory: bool,
                 video_path: str,
                 directory_upload_path: str,
+                only_process_every_x_frames: bool,
+                test_run: bool,
+                test_run_frames_count: int,
+                frames_to_grids: bool,
+                frames_per_grid: str,
         ):
             temp_video = VideoVeilSourceVideo(
-                use_images_directory=use_directory_for_video,
+                use_images_directory=use_images_directory,
                 video_path=video_path,
                 directory_upload_path=directory_upload_path,
-                only_process_every_x_frames=1,
-                test_run=True,
-                test_run_frames_count=1,
-                throw_errors_when_invalid=False
+                only_process_every_x_frames=only_process_every_x_frames,
+                test_run=test_run,
+                test_run_frames_count=test_run_frames_count,
+                throw_errors_when_invalid=False,
+                frames_to_grids=frames_to_grids,
+                frames_per_grid=frames_per_grid,
             )
 
-            if len(temp_video.frames) > 0:
+            frames: list[VideoVeilSourceVideoFrame] = temp_video.frames_to_process()
+            if len(frames) > 0:
                 # Update the img2img settings via the existing Gradio controls
-                first_frame = temp_video.frames[0]
+                first_frame = frames[0]
 
-                message = f"<div style='color: #333'>Video Frames found: {first_frame.width}x{first_frame.height}px</div>"
+                message = f"<div style='color: #333'>{first_frame.width}px (W) x {first_frame.height}px (H)</div>"
                 if temp_video.video_fps > 0:
-                    message += f"<div style='color: #333'>Video FPS: {temp_video.video_fps} fps</div>"
+                    message += f"<div style='color: #333'>{temp_video.video_fps} fps</div>"
                 if temp_video.video_total_frames > 0:
-                    message += f"<div style='color: #333'>Video Total Frames: {temp_video.video_total_frames} frames</div>"
+                    message += f"<div style='color: #333'>{temp_video.video_total_frames} frames</div>"
 
                 return {
                     self.img2img_component: gr.update(value=first_frame.frame_image),
                     self.img2img_w_slider: gr.update(value=first_frame.width),
                     self.img2img_h_slider: gr.update(value=first_frame.height),
+                    test_run_frames_count_gr: gr.update(interactive=not frames_to_grids),
                     video_source_info_gr: gr.update(value=message)
                 }
             else:
@@ -172,12 +221,18 @@ class Script(scripts.Script):
                     self.img2img_component: gr.update(value=None),
                     self.img2img_w_slider: gr.update(value=512),
                     self.img2img_h_slider: gr.update(value=512),
+                    test_run_frames_count_gr: gr.update(interactive=not frames_to_grids),
                     video_source_info_gr: gr.update(value=f"<div style='color: red'>{error_message}</div>")
                 }
 
         source_inputs = [
             video_path_gr,
             directory_upload_path_gr,
+            only_process_every_x_frames_gr,
+            test_run_gr,
+            test_run_frames_count_gr,
+            frames_to_grids_gr,
+            frames_per_grid_gr,
         ]
 
         for source_input in source_inputs:
@@ -187,22 +242,28 @@ class Script(scripts.Script):
                     use_images_directory_gr,
                     video_path_gr,
                     directory_upload_path_gr,
+                    only_process_every_x_frames_gr,
+                    test_run_gr,
+                    test_run_frames_count_gr,
+                    frames_to_grids_gr,
+                    frames_per_grid_gr,
                 ],
                 outputs=[
                     self.img2img_component,
                     self.img2img_w_slider,
                     self.img2img_h_slider,
+                    test_run_frames_count_gr,
                     video_source_info_gr,
                 ]
             )
 
         # Upload type change
         def change_upload_type_click(
-                use_directory_for_video: bool
+                use_images_directory: bool
         ):
             return {
-                video_path_gr: gr.update(visible=not use_directory_for_video),
-                directory_upload_path_gr: gr.update(visible=use_directory_for_video),
+                video_path_gr: gr.update(visible=not use_images_directory),
+                directory_upload_path_gr: gr.update(visible=use_images_directory),
             }
 
         use_images_directory_gr.change(
@@ -225,6 +286,8 @@ class Script(scripts.Script):
             test_run_gr,
             test_run_frames_count_gr,
             ebsynth_project_gr,
+            frames_to_grids_gr,
+            frames_per_grid_gr
         )
 
     # From: https://github.com/LonicaMewinsky/gif2gif/blob/main/scripts/gif2gif.py
@@ -264,7 +327,9 @@ class Script(scripts.Script):
             only_process_every_x_frames: int,
             test_run: bool,
             test_run_frames_count: int,
-            ebsynth_project: bool
+            ebsynth_project: bool,
+            frames_to_grids: bool,
+            frames_per_grid: str
     ):
         no_video_path = video_path is None or video_path == ""
         no_directory_upload_path = directory_upload_path is None or directory_upload_path == ""
@@ -279,7 +344,9 @@ class Script(scripts.Script):
                 only_process_every_x_frames=only_process_every_x_frames,
                 test_run=test_run,
                 test_run_frames_count=test_run_frames_count,
-                throw_errors_when_invalid=True
+                throw_errors_when_invalid=True,
+                frames_to_grids=frames_to_grids,
+                frames_per_grid=frames_per_grid,
             )
 
             print(f"color_correction: {color_correction}")

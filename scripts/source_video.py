@@ -1,6 +1,8 @@
 import os
 
+import copy
 import cv2
+import math
 from PIL import Image
 import numpy as np
 from datetime import datetime, timezone
@@ -23,6 +25,61 @@ class VideoVeilSourceVideoFrame:
         # Capture the dimensions of our image
         self.height, self.width, _ = self.frame_array.shape
 
+class VideoVeilGridImage:
+    def __init__(
+            self,
+            frames: list[Image],
+            index: int,
+            columns: int,
+            rows: int,
+            frame_width: int,
+            frame_height: int,
+    ):
+        self.frames = copy.copy(frames)
+        self.index = index
+        self.columns = columns
+        self.rows = rows
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.transformed_frames_as_grid: Image = None
+
+        self.grid_width = int(self.frame_width * self.columns)
+        self.grid_height = int(self.frame_height * self.rows)
+        self.empty_images_to_generate = self.rows * self.columns - len(self.frames)
+
+        self.px_locations = self.get_pixel_locations_for_grid_images()
+        self.grid_image: VideoVeilSourceVideoFrame = self.get_grid_of_images()
+        self.transformed_grid_image: Image = None
+
+    def get_pixel_locations_for_grid_images(self):
+        px_locations = []
+        for y in range(self.rows):
+            for x in range(self.columns):
+                px_locations.append((x * self.frame_width, y * self.frame_height))
+
+        return px_locations
+
+    def get_grid_of_images(self) -> VideoVeilSourceVideoFrame:
+        original_frames_as_grid = Image.new(mode="RGB", size=(self.grid_width, self.grid_height))
+        for i, frame in enumerate(self.frames):
+            x_px, y_px = self.px_locations[i]
+            original_frames_as_grid.paste(frame, box=(x_px, y_px))
+
+        return VideoVeilSourceVideoFrame(
+            frame_image=original_frames_as_grid,
+        )
+
+    def get_transformed_images_from_grid(self) -> list[Image]:
+        transformed_frames: list[Image] = []
+        if self.transformed_grid_image is not None:
+            for i, frame in self.frames:
+                left_px, top_px = self.px_locations[i]
+                crop_box = (left_px, top_px, left_px + self.frame_width, top_px + self.frame_height)
+                temp_image = self.grid_image.copy()
+                sub_image = temp_image.crop(crop_box)
+                transformed_frames.append(sub_image)
+
+        return transformed_frames
 
 class VideoVeilSourceVideo:
     def __init__(
@@ -34,6 +91,8 @@ class VideoVeilSourceVideo:
             test_run: bool,
             test_run_frames_count: int,
             throw_errors_when_invalid: bool,
+            frames_to_grids: bool,
+            frames_per_grid: str,
     ):
         self.use_images_directory: bool = use_images_directory
         self.video_path: str = video_path
@@ -50,10 +109,29 @@ class VideoVeilSourceVideo:
         self.controlnet_modules: list[str] = []
         self.throw_errors_when_invalid = throw_errors_when_invalid
 
+        # Convert frames to grids
+        self.frames_to_grids = frames_to_grids
+
+        # frames_per_grid will be "2x2" or "3x3" etc
+        self.frames_per_grid = frames_per_grid
+        if self.frames_to_grids:
+            self.columns, self.rows = [int(i) for i in self.frames_per_grid.split("x")]
+
+            if self.test_run:
+                # update the frames count so we can get an entire grid worth of images to test.
+                self.test_run_frames_count = self.test_run_frames_count * self.columns * self.rows
+                self.only_process_every_x_frames = 1
+        else:
+            self.columns = 0
+            self.rows = 0
+
         frames = self.get_frames()
 
         print(f"Frames: {len(frames)}")
         self.frames: list[VideoVeilSourceVideoFrame] = frames
+
+        self.grids_of_frames: list[VideoVeilGridImage] = self.convert_frames_to_grids()
+        print(f"Grids: {len(self.grids_of_frames)}")
 
         if len(self.frames) > 0:
             first_frame = self.frames[0]
@@ -78,16 +156,76 @@ class VideoVeilSourceVideo:
 
         return frames
 
+    def convert_frames_to_grids(self) -> list[VideoVeilGridImage]:
+        grids_of_frames = []
+
+        if self.frames_to_grids:
+            total_frames = len(self.frames)
+            if total_frames > 0:
+                print(f"Total Frames for Grid: {total_frames}")
+
+                total_images_per_grid = self.columns * self.rows
+                total_grids_to_generate = math.ceil(total_frames / total_images_per_grid)
+
+                print(f"Generating {total_grids_to_generate} grids")
+
+                grid_index = 0
+                temp_images_for_grid: list[Image] = []
+                for i, frame in enumerate(self.frames):
+                    if self.test_run and self.test_run_frames_count is not None and len(grids_of_frames) >= self.test_run_frames_count:
+                        break
+
+                    is_grid_full: bool = (i % total_images_per_grid) == 0 or (i + 1) == total_frames
+
+                    if is_grid_full and (i > 0 or (total_frames == 1 and i == 0)):
+                        grids_of_frames.append(VideoVeilGridImage(
+                            frames=temp_images_for_grid,
+                            index=grid_index,
+                            columns=self.columns,
+                            rows=self.rows,
+                            frame_width=self.video_width,
+                            frame_height=self.video_height,
+                        ))
+                        temp_images_for_grid = []
+                        grid_index += 1
+
+                    temp_images_for_grid.append(frame.frame_image)
+            else:
+                print("No frames found to generate a grid for")
+        else:
+            print("Not sending our frames to grids for processing")
+
+        return grids_of_frames
+
     def frames_to_process(self) -> list[VideoVeilSourceVideoFrame]:
-        return [
-            frame for frame in self.frames
-        ]
+        if self.frames_to_grids:
+            grid_images = []
+            for grid in self.grids_of_frames:
+                grid_images.append(grid.grid_image)
+            return grid_images
+        else:
+            return [
+                frame for frame in self.frames
+            ]
 
     def transformed_frames(self) -> list[Image]:
-        return [
-            frame.transformed_image for frame in self.frames
-            if frame.transformed_image is not None
-        ]
+        if self.frames_to_grids:
+            transformed_images: list[Image] = []
+
+            grids_with_transforms = [
+                frame.transformed_image for frame in self.grids_of_frames
+                if frame.transformed_image is not None
+            ]
+
+            for grid in grids_with_transforms:
+                transformed_images.extend(grid.get_transformed_images_from_grid())
+
+            return transformed_images
+        else:
+            return [
+                frame.transformed_image for frame in self.frames
+                if frame.transformed_image is not None
+            ]
 
     def controlnet_images(self) -> list[np.ndarray]:
         cn_images: list[np.ndarray] = []
@@ -97,6 +235,7 @@ class VideoVeilSourceVideo:
                 cn_images.append(cn_image)
 
         return cn_images
+
 
     def _load_controlnets(self, p):
         self.controlnet_units: list[ControlNetUnit] = []
@@ -197,7 +336,7 @@ class VideoVeilSourceVideo:
         else:
             # get the original file name, and slap a timestamp on it
             original_file_name: str = ""
-            fps = 30  # TODO: Add this as an option when they pick a folder
+            fps = self.video_fps  # TODO: Add this as an option when they pick a folder
             if not self.use_images_directory:
                 original_file_name = os.path.basename(self.video_path)
                 clip = cv2.VideoCapture(self.video_path)
